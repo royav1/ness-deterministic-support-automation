@@ -1,0 +1,143 @@
+from typing import Dict, List, Tuple, Optional, Any
+import uuid
+import time
+
+from app.schemas.chat_models import Intent, VpnContext
+
+
+class MemoryStore:
+    """
+    In-memory session store with TTL.
+
+    - session_id -> list of (role, message)
+    - session_id -> last detected intent (context)
+    - session_id -> vpn context (Part 2)
+    - session_id -> company_id (tenant)
+    - session_id -> pending_handoff_summary (dict)  # used when tenant is missing at escalation time
+    - session_id -> last_seen timestamp (for expiration)
+    """
+
+    def __init__(self, ttl_seconds: int = 30 * 60) -> None:
+        self._sessions: Dict[str, List[Tuple[str, str]]] = {}
+        self._last_intent: Dict[str, Intent] = {}
+        self._vpn_context: Dict[str, VpnContext] = {}
+        self._company_id: Dict[str, str] = {}
+        self._pending_handoff_summary: Dict[str, Dict[str, Any]] = {}
+        self._last_seen: Dict[str, float] = {}
+        self._ttl_seconds = ttl_seconds
+
+    def cleanup_expired(self) -> int:
+        now = time.time()
+        expired_ids: List[str] = []
+
+        for sid, last_seen in list(self._last_seen.items()):
+            if now - last_seen > self._ttl_seconds:
+                expired_ids.append(sid)
+
+        for sid in expired_ids:
+            self._sessions.pop(sid, None)
+            self._last_intent.pop(sid, None)
+            self._vpn_context.pop(sid, None)
+            self._company_id.pop(sid, None)
+            self._pending_handoff_summary.pop(sid, None)
+            self._last_seen.pop(sid, None)
+
+        return len(expired_ids)
+
+    def _touch(self, session_id: str) -> None:
+        self._last_seen[session_id] = time.time()
+
+    def get_or_create_session(self, session_id: str | None) -> tuple[str, bool]:
+        self.cleanup_expired()
+
+        if session_id and session_id in self._sessions:
+            self._touch(session_id)
+            return session_id, False
+
+        new_session_id = session_id or str(uuid.uuid4())
+        created = new_session_id not in self._sessions
+
+        self._sessions.setdefault(new_session_id, [])
+        self._touch(new_session_id)
+        return new_session_id, created
+
+    def session_exists(self, session_id: str) -> bool:
+        self.cleanup_expired()
+        return session_id in self._sessions
+
+    def add_message(self, session_id: str, role: str, message: str) -> None:
+        self.cleanup_expired()
+        self._sessions.setdefault(session_id, []).append((role, message))
+        self._touch(session_id)
+
+    def get_history(self, session_id: str) -> List[Tuple[str, str]]:
+        self.cleanup_expired()
+        self._touch(session_id) if session_id in self._sessions else None
+        return self._sessions.get(session_id, [])
+
+    def get_last_intent(self, session_id: str) -> Optional[Intent]:
+        self.cleanup_expired()
+        self._touch(session_id) if session_id in self._sessions else None
+        return self._last_intent.get(session_id)
+
+    def set_last_intent(self, session_id: str, intent: Intent) -> None:
+        self.cleanup_expired()
+        self._last_intent[session_id] = intent
+        self._touch(session_id)
+
+    # ===== Company / tenant =====
+
+    def get_company_id(self, session_id: str) -> Optional[str]:
+        self.cleanup_expired()
+        self._touch(session_id) if session_id in self._sessions else None
+        return self._company_id.get(session_id)
+
+    def set_company_id(self, session_id: str, company_id: str) -> None:
+        self.cleanup_expired()
+        self._company_id[session_id] = company_id
+        self._touch(session_id)
+
+    # ===== Pending handoff (tenant missing at escalation time) =====
+
+    def get_pending_handoff_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
+        self.cleanup_expired()
+        self._touch(session_id) if session_id in self._sessions else None
+        return self._pending_handoff_summary.get(session_id)
+
+    def set_pending_handoff_summary(self, session_id: str, summary: Dict[str, Any]) -> None:
+        self.cleanup_expired()
+        self._pending_handoff_summary[session_id] = summary
+        self._touch(session_id)
+
+    def clear_pending_handoff(self, session_id: str) -> None:
+        self.cleanup_expired()
+        self._pending_handoff_summary.pop(session_id, None)
+        self._touch(session_id) if session_id in self._sessions else None
+
+    # ===== VPN context (Part 2) =====
+
+    def get_vpn_context(self, session_id: str) -> VpnContext:
+        self.cleanup_expired()
+        self._touch(session_id) if session_id in self._sessions else None
+        return self._vpn_context.get(session_id, VpnContext())
+
+    def set_vpn_context(self, session_id: str, ctx: VpnContext) -> None:
+        self.cleanup_expired()
+        self._vpn_context[session_id] = ctx
+        self._touch(session_id)
+
+    def clear_vpn_context(self, session_id: str) -> None:
+        self.cleanup_expired()
+        self._vpn_context.pop(session_id, None)
+        self._touch(session_id) if session_id in self._sessions else None
+
+    def delete_session(self, session_id: str) -> bool:
+        self.cleanup_expired()
+        existed = session_id in self._sessions
+        self._sessions.pop(session_id, None)
+        self._last_intent.pop(session_id, None)
+        self._vpn_context.pop(session_id, None)
+        self._company_id.pop(session_id, None)
+        self._pending_handoff_summary.pop(session_id, None)
+        self._last_seen.pop(session_id, None)
+        return existed
