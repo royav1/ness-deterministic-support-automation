@@ -18,7 +18,7 @@ class TenantConfig:
     # Optional
     component: Optional[str] = None
 
-    # NEW: internal-tag -> jira labels mapping (per tenant)
+    # internal-tag -> jira labels mapping (per tenant)
     # Example: "stability" -> ("vpn-disconnect",)
     label_map: Dict[str, Tuple[str, ...]] = None  # type: ignore[assignment]
 
@@ -32,7 +32,7 @@ TENANTS: Dict[str, TenantConfig] = {
         default_labels=("it-support", "vpn"),
         component="Network",
         label_map={
-            # Domain
+            # ===== VPN domain =====
             "vpn": ("vpn",),
 
             # Problem class
@@ -52,6 +52,12 @@ TENANTS: Dict[str, TenantConfig] = {
             "error_619": ("error-619",),
             "error_809": ("error-809",),
             "error_812": ("error-812",),
+
+            # ===== Generic (pre-LLM) domains =====
+            "password": ("password-reset",),
+            "email": ("email-issue",),
+            "general": ("it-general",),
+            "unknown": ("needs-triage",),
         },
     ),
     "ness_auto": TenantConfig(
@@ -62,7 +68,7 @@ TENANTS: Dict[str, TenantConfig] = {
         default_labels=("helpdesk", "vpn"),
         component="IT",
         label_map={
-            # Domain
+            # ===== VPN domain =====
             "vpn": ("vpn",),
 
             # Problem class (different naming style)
@@ -82,6 +88,12 @@ TENANTS: Dict[str, TenantConfig] = {
             "error_619": ("err-619",),
             "error_809": ("err-809",),
             "error_812": ("err-812",),
+
+            # ===== Generic (pre-LLM) domains =====
+            "password": ("pwd", "reset"),
+            "email": ("mail", "outlook"),
+            "general": ("general",),
+            "unknown": ("triage",),
         },
     ),
 }

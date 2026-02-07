@@ -16,6 +16,9 @@ class RedisMemoryStore:
       - session:{id}:vpn_context         (Redis STRING) JSON dump of VpnContext
       - session:{id}:company_id          (Redis STRING)
       - session:{id}:pending_handoff     (Redis STRING) JSON dump of handoff_summary
+
+    Email idempotency (Mode A):
+      - email:{message_id}:processed     (Redis STRING) value="1" with TTL
     """
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0", ttl_seconds: int = 30 * 60) -> None:
@@ -36,6 +39,11 @@ class RedisMemoryStore:
 
     def _pending_handoff_key(self, session_id: str) -> str:
         return f"session:{session_id}:pending_handoff"
+
+    # ===== Email idempotency (Mode A) =====
+
+    def _email_processed_key(self, message_id: str) -> str:
+        return f"email:{message_id}:processed"
 
     def _touch(self, session_id: str) -> None:
         mk = self._messages_key(session_id)
@@ -157,6 +165,23 @@ class RedisMemoryStore:
         vk = self._vpn_key(session_id)
         self.redis.delete(vk)
         self._touch(session_id)
+
+    # ===== Email idempotency (Mode A) =====
+
+    def is_email_processed(self, message_id: str) -> bool:
+        mid = (message_id or "").strip()
+        if not mid:
+            return False
+        k = self._email_processed_key(mid)
+        return self.redis.exists(k) == 1
+
+    def mark_email_processed(self, message_id: str) -> None:
+        mid = (message_id or "").strip()
+        if not mid:
+            return
+        k = self._email_processed_key(mid)
+        # store marker with TTL (idempotency window)
+        self.redis.setex(k, self.ttl_seconds, "1")
 
     def delete_session(self, session_id: str) -> bool:
         mk = self._messages_key(session_id)

@@ -114,3 +114,85 @@ def build_vpn_incident_payload(
         fields["reporter"] = {"name": reporter}
 
     return {"fields": fields}
+
+
+def build_generic_incident_payload(
+    *,
+    correlation_id: str,
+    handoff_summary: Dict[str, Any],
+    project_key: str = "IT",
+    issue_type: str = "Incident",
+    reporter: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a generic Jira 'create issue' payload for non-VPN categories
+    (PASSWORD_RESET / EMAIL_ISSUE / GENERAL / UNKNOWN, etc.).
+
+    Designed primarily for email ingestion Mode A.
+
+    Expected minimal structure:
+      {
+        "category": "PASSWORD_RESET" | "EMAIL_ISSUE" | "GENERAL" | "UNKNOWN" | ...,
+        "state": "EMAIL_INGEST",
+        "email": {
+          "message_id": "...",
+          "from": "...",
+          "to": "...",
+          "subject": "..."
+        },
+        "body": "..."
+      }
+    """
+
+    category = _safe_str(handoff_summary.get("category")).strip() or "GENERAL"
+    state = _safe_str(handoff_summary.get("state")).strip() or "EMAIL_INGEST"
+
+    email_obj = handoff_summary.get("email") or {}
+    if not isinstance(email_obj, dict):
+        email_obj = {}
+
+    subject = _safe_str(email_obj.get("subject")).strip() or "No subject"
+    from_email = _safe_str(email_obj.get("from")).strip() or "Unknown sender"
+    to_email = _safe_str(email_obj.get("to")).strip() or "Unknown recipient"
+    message_id = _safe_str(email_obj.get("message_id")).strip() or correlation_id
+
+    body = _safe_str(handoff_summary.get("body")).strip()
+
+    # Summary: keep short and consistent
+    summary = f"{category}: {subject}"
+    if len(summary) > 250:
+        summary = summary[:247] + "..."
+
+    # Description: structured, useful for triage
+    description_lines: List[str] = [
+        "Automated ticket created from inbound email (Chatbox Support Automation):",
+        "",
+        f"Correlation ID: {correlation_id}",
+        f"Category: {category}",
+        f"Flow state: {state}",
+        "",
+        "Email metadata:",
+        f"- Message-ID: {message_id}",
+        f"- From: {from_email}",
+        f"- To: {to_email}",
+        f"- Subject: {subject}",
+        "",
+        "Email body:",
+        body or "N/A",
+    ]
+
+    fields: Dict[str, Any] = {
+        "project": {"key": project_key},
+        "issuetype": {"name": issue_type},
+        "summary": summary,
+        "description": "\n".join(description_lines),
+    }
+
+    if labels:
+        fields["labels"] = labels
+
+    if reporter:
+        fields["reporter"] = {"name": reporter}
+
+    return {"fields": fields}

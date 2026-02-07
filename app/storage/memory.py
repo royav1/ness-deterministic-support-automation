@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Dict, List, Tuple, Optional, Any
 import uuid
 import time
@@ -15,6 +17,10 @@ class MemoryStore:
     - session_id -> company_id (tenant)
     - session_id -> pending_handoff_summary (dict)  # used when tenant is missing at escalation time
     - session_id -> last_seen timestamp (for expiration)
+
+    Email ingestion (Mode A):
+    - message_id -> processed marker (idempotency / dedupe)
+    - message_id -> receipt (stored response payload for deterministic duplicate responses)
     """
 
     def __init__(self, ttl_seconds: int = 30 * 60) -> None:
@@ -24,6 +30,15 @@ class MemoryStore:
         self._company_id: Dict[str, str] = {}
         self._pending_handoff_summary: Dict[str, Dict[str, Any]] = {}
         self._last_seen: Dict[str, float] = {}
+
+        # Email idempotency (Mode A)
+        # message_id -> timestamp when marked processed
+        self._processed_emails: Dict[str, float] = {}
+
+        # Email receipts (Option B)
+        # message_id -> {"ts": float, "receipt": dict}
+        self._email_receipts: Dict[str, Dict[str, Any]] = {}
+
         self._ttl_seconds = ttl_seconds
 
     def cleanup_expired(self) -> int:
@@ -41,6 +56,17 @@ class MemoryStore:
             self._company_id.pop(sid, None)
             self._pending_handoff_summary.pop(sid, None)
             self._last_seen.pop(sid, None)
+
+        # Cleanup email processed markers on the same TTL window
+        for mid, ts in list(self._processed_emails.items()):
+            if now - ts > self._ttl_seconds:
+                self._processed_emails.pop(mid, None)
+
+        # Cleanup email receipts on the same TTL window
+        for mid, obj in list(self._email_receipts.items()):
+            ts = obj.get("ts")
+            if isinstance(ts, (int, float)) and (now - float(ts) > self._ttl_seconds):
+                self._email_receipts.pop(mid, None)
 
         return len(expired_ids)
 
@@ -72,12 +98,14 @@ class MemoryStore:
 
     def get_history(self, session_id: str) -> List[Tuple[str, str]]:
         self.cleanup_expired()
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
         return self._sessions.get(session_id, [])
 
     def get_last_intent(self, session_id: str) -> Optional[Intent]:
         self.cleanup_expired()
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
         return self._last_intent.get(session_id)
 
     def set_last_intent(self, session_id: str, intent: Intent) -> None:
@@ -89,7 +117,8 @@ class MemoryStore:
 
     def get_company_id(self, session_id: str) -> Optional[str]:
         self.cleanup_expired()
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
         return self._company_id.get(session_id)
 
     def set_company_id(self, session_id: str, company_id: str) -> None:
@@ -101,7 +130,8 @@ class MemoryStore:
 
     def get_pending_handoff_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
         self.cleanup_expired()
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
         return self._pending_handoff_summary.get(session_id)
 
     def set_pending_handoff_summary(self, session_id: str, summary: Dict[str, Any]) -> None:
@@ -112,13 +142,15 @@ class MemoryStore:
     def clear_pending_handoff(self, session_id: str) -> None:
         self.cleanup_expired()
         self._pending_handoff_summary.pop(session_id, None)
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
 
     # ===== VPN context (Part 2) =====
 
     def get_vpn_context(self, session_id: str) -> VpnContext:
         self.cleanup_expired()
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
         return self._vpn_context.get(session_id, VpnContext())
 
     def set_vpn_context(self, session_id: str, ctx: VpnContext) -> None:
@@ -129,7 +161,51 @@ class MemoryStore:
     def clear_vpn_context(self, session_id: str) -> None:
         self.cleanup_expired()
         self._vpn_context.pop(session_id, None)
-        self._touch(session_id) if session_id in self._sessions else None
+        if session_id in self._sessions:
+            self._touch(session_id)
+
+    # ===== Email idempotency + receipts (Mode A / Option B) =====
+
+    def is_email_processed(self, message_id: str) -> bool:
+        self.cleanup_expired()
+        mid = (message_id or "").strip()
+        if not mid:
+            return False
+        return mid in self._processed_emails
+
+    def mark_email_processed(self, message_id: str) -> None:
+        self.cleanup_expired()
+        mid = (message_id or "").strip()
+        if not mid:
+            return
+        self._processed_emails[mid] = time.time()
+
+    def get_email_receipt(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return stored receipt dict (response payload) for a processed email message_id.
+        Used to return deterministic information on duplicates.
+        """
+        self.cleanup_expired()
+        mid = (message_id or "").strip()
+        if not mid:
+            return None
+        obj = self._email_receipts.get(mid)
+        if not isinstance(obj, dict):
+            return None
+        receipt = obj.get("receipt")
+        return receipt if isinstance(receipt, dict) else None
+
+    def set_email_receipt(self, message_id: str, receipt: Dict[str, Any]) -> None:
+        """
+        Store receipt dict (response payload) for a processed email message_id.
+        """
+        self.cleanup_expired()
+        mid = (message_id or "").strip()
+        if not mid:
+            return
+        if not isinstance(receipt, dict):
+            return
+        self._email_receipts[mid] = {"ts": time.time(), "receipt": receipt}
 
     def delete_session(self, session_id: str) -> bool:
         self.cleanup_expired()

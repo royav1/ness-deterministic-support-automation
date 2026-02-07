@@ -62,6 +62,23 @@ def _problem_class_from_symptom(symptom: Optional[str]) -> str:
     return "other"
 
 
+def _dedupe_normalized(tags: List[str]) -> List[str]:
+    """
+    Deduplicate while preserving order.
+    Also normalizes to lowercase/stripped, and drops empties.
+    """
+    seen = set()
+    out: List[str] = []
+    for t in tags:
+        t2 = _safe_str(t).strip().lower()
+        if not t2:
+            continue
+        if t2 not in seen:
+            seen.add(t2)
+            out.append(t2)
+    return out
+
+
 def build_internal_tags_for_vpn(handoff_summary: Dict[str, Any], *, include_process_tag: bool = True) -> List[str]:
     """
     Build internal-only tags for VPN handoff.
@@ -93,18 +110,30 @@ def build_internal_tags_for_vpn(handoff_summary: Dict[str, Any], *, include_proc
     if include_process_tag:
         tags.append("escalated")
 
-    # Deduplicate while preserving order
-    seen = set()
-    out: List[str] = []
-    for t in tags:
-        t2 = _safe_str(t).strip().lower()
-        if not t2:
-            continue
-        if t2 not in seen:
-            seen.add(t2)
-            out.append(t2)
+    return _dedupe_normalized(tags)
 
-    return out
+
+def build_internal_tags_for_generic(category: str) -> List[str]:
+    """
+    Minimal stable taxonomy for non-VPN categories (pre-LLM).
+
+    We keep it intentionally small and consistent across tenants.
+    Later the LLM can enrich signals (systems, apps, urgency, etc.)
+    without changing the meaning of these base tags.
+    """
+    c = _safe_str(category).strip().upper()
+
+    if c == "PASSWORD_RESET":
+        return _dedupe_normalized(["password", "escalated"])
+
+    if c == "EMAIL_ISSUE":
+        return _dedupe_normalized(["email", "escalated"])
+
+    if c == "GENERAL":
+        return _dedupe_normalized(["general", "escalated"])
+
+    # UNKNOWN or anything else
+    return _dedupe_normalized(["unknown", "escalated"])
 
 
 def attach_internal_tags(handoff_summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,11 +146,9 @@ def attach_internal_tags(handoff_summary: Dict[str, Any]) -> Dict[str, Any]:
 
     category = _safe_str(handoff_summary.get("category")).strip().upper()
 
-    # For now: only VPN. Easy to extend later.
     if category == "VPN_ISSUE":
         handoff_summary["internal_tags"] = build_internal_tags_for_vpn(handoff_summary)
     else:
-        # future: EMAIL_ISSUE / PASSWORD_RESET / etc.
-        handoff_summary["internal_tags"] = ["escalated"]
+        handoff_summary["internal_tags"] = build_internal_tags_for_generic(category)
 
     return handoff_summary

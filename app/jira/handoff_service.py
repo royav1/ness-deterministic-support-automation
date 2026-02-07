@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.jira.jira_payloads import build_vpn_incident_payload
+from app.jira.jira_payloads import (
+    build_vpn_incident_payload,
+    build_generic_incident_payload,
+)
 from app.jira.jira_label_mapping import map_internal_tags_to_jira_labels
 from app.tagging.internal_tags import attach_internal_tags
 from app.tenants.tenant_configs import TenantConfig
@@ -42,6 +45,29 @@ def build_vpn_payload_preview(
 
     payload = build_vpn_incident_payload(
         session_id=session_id,
+        handoff_summary=handoff_summary,
+        project_key=tenant.jira_project_key,
+        issue_type=tenant.jira_issue_type,
+        labels=labels,
+    )
+    return payload, labels
+
+
+def build_generic_payload_preview(
+    *,
+    correlation_id: str,
+    tenant: TenantConfig,
+    handoff_summary: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Generic (non-VPN) Jira payload preview.
+    Used by email ingestion for PASSWORD_RESET / EMAIL_ISSUE / GENERAL / UNKNOWN.
+    """
+    ensure_internal_tags(handoff_summary)
+    labels = build_labels_for_tenant(tenant, handoff_summary)
+
+    payload = build_generic_incident_payload(
+        correlation_id=correlation_id,
         handoff_summary=handoff_summary,
         project_key=tenant.jira_project_key,
         issue_type=tenant.jira_issue_type,
