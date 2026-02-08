@@ -22,29 +22,37 @@ def ingest_email(
     if expired:
         logger.info(f"cleanup_expired removed={expired}")
 
+    message_id = (request.message_id or "").strip()
+
     # ---- Idempotency / dedupe (Option B: return stored receipt) ----
-    if memory.is_email_processed(request.message_id):
+    if message_id and memory.is_email_processed(message_id):
         receipt: Optional[Dict[str, Any]] = None
         getter = getattr(memory, "get_email_receipt", None)
         if callable(getter):
             try:
-                receipt = getter(request.message_id)
+                receipt = getter(message_id)
             except Exception:
                 receipt = None
 
-        logger.info(f"email_duplicate_skipped message_id={request.message_id}")
+        logger.info(f"email_duplicate_skipped message_id={message_id}")
 
         if receipt and isinstance(receipt, dict):
-            # Return the original receipt, but mark status as duplicate
+            # Return the original receipt, but mark status as duplicate.
+            # Also force the idempotency key to be present & correct.
             receipt_out = dict(receipt)
             receipt_out["status"] = "duplicate_skipped"
-            receipt_out["message_id"] = request.message_id
-            return EmailIngestResponse(**receipt_out)
+            receipt_out["message_id"] = message_id
 
-        # Fallback if receipt not available (should be rare)
+            try:
+                return EmailIngestResponse(**receipt_out)
+            except Exception:
+                # If schema changed and old receipts don't match, fallback cleanly.
+                pass
+
+        # Fallback if receipt not available / incompatible (should be rare)
         return EmailIngestResponse(
             status="duplicate_skipped",
-            message_id=request.message_id,
+            message_id=message_id or request.message_id,
             tenant_id=None,
             intent="UNKNOWN",
             confidence=0.0,
@@ -71,7 +79,7 @@ def ingest_email(
 
     response = EmailIngestResponse(
         status=status,
-        message_id=request.message_id,
+        message_id=message_id or request.message_id,
         tenant_id=tenant_id,
         intent=intent,
         confidence=float(confidence),
@@ -81,14 +89,14 @@ def ingest_email(
     )
 
     # Mark processed + store receipt only if we truly processed (tenant known and payload built)
-    if status == "processed":
-        memory.mark_email_processed(request.message_id)
+    if status == "processed" and message_id:
+        memory.mark_email_processed(message_id)
 
         setter = getattr(memory, "set_email_receipt", None)
         if callable(setter):
             try:
                 # Store "processed" receipt. On duplicates we override status to duplicate_skipped.
-                setter(request.message_id, response.model_dump())
+                setter(message_id, response.model_dump())
             except Exception:
                 pass
 

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import json
-from typing import List, Tuple, Optional, Dict, Any
 import uuid
+from typing import List, Tuple, Optional, Dict, Any
 
 from redis import Redis
 from app.schemas.chat_models import Intent, VpnContext
@@ -17,8 +19,9 @@ class RedisMemoryStore:
       - session:{id}:company_id          (Redis STRING)
       - session:{id}:pending_handoff     (Redis STRING) JSON dump of handoff_summary
 
-    Email idempotency (Mode A):
+    Email ingestion (Mode A):
       - email:{message_id}:processed     (Redis STRING) value="1" with TTL
+      - email:{message_id}:receipt       (Redis STRING) JSON receipt with TTL
     """
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0", ttl_seconds: int = 30 * 60) -> None:
@@ -40,10 +43,13 @@ class RedisMemoryStore:
     def _pending_handoff_key(self, session_id: str) -> str:
         return f"session:{session_id}:pending_handoff"
 
-    # ===== Email idempotency (Mode A) =====
+    # ===== Email idempotency / receipts (Mode A - Option B) =====
 
     def _email_processed_key(self, message_id: str) -> str:
         return f"email:{message_id}:processed"
+
+    def _email_receipt_key(self, message_id: str) -> str:
+        return f"email:{message_id}:receipt"
 
     def _touch(self, session_id: str) -> None:
         mk = self._messages_key(session_id)
@@ -166,7 +172,7 @@ class RedisMemoryStore:
         self.redis.delete(vk)
         self._touch(session_id)
 
-    # ===== Email idempotency (Mode A) =====
+    # ===== Email idempotency + receipts (Mode A) =====
 
     def is_email_processed(self, message_id: str) -> bool:
         mid = (message_id or "").strip()
@@ -182,6 +188,38 @@ class RedisMemoryStore:
         k = self._email_processed_key(mid)
         # store marker with TTL (idempotency window)
         self.redis.setex(k, self.ttl_seconds, "1")
+
+    def get_email_receipt(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return stored receipt dict (response payload) for a processed email message_id.
+        """
+        mid = (message_id or "").strip()
+        if not mid:
+            return None
+
+        rk = self._email_receipt_key(mid)
+        raw = self.redis.get(rk)
+        if not raw:
+            return None
+
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def set_email_receipt(self, message_id: str, receipt: Dict[str, Any]) -> None:
+        """
+        Store receipt dict (response payload) for a processed email message_id, with TTL.
+        """
+        mid = (message_id or "").strip()
+        if not mid:
+            return
+        if not isinstance(receipt, dict):
+            return
+
+        rk = self._email_receipt_key(mid)
+        self.redis.setex(rk, self.ttl_seconds, json.dumps(receipt, ensure_ascii=False))
 
     def delete_session(self, session_id: str) -> bool:
         mk = self._messages_key(session_id)
