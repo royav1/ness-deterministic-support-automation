@@ -15,8 +15,10 @@ from app.jira.handoff_service import (
 from app.flows.vpn.vpn_nlp import extract_os, extract_client, extract_symptom, extract_error_code
 
 
-# Optional: infer tenant from recipient mailbox (very common in real setups)
-# Keep it tiny for now; easy to expand later.
+# ---------------------------------------------------------------------
+# Tenant inference from recipient email (realistic simulation)
+# ---------------------------------------------------------------------
+
 TENANT_EMAIL_HINTS = {
     "ness_bank": ["bank", "ness_bank"],
     "ness_auto": ["auto", "ness_auto"],
@@ -24,12 +26,41 @@ TENANT_EMAIL_HINTS = {
 
 
 def infer_tenant_id_from_to_email(to_email: str) -> Optional[str]:
-    t = (to_email or "").lower()
+    """
+    Infer tenant from recipient email.
+
+    Priority:
+    1) Plus-addressing: support+ness_bank@company.com
+    2) Keyword hints in mailbox/domain
+
+    This simulates real IT support inbox routing without real mailboxes.
+    """
+    if not to_email:
+        return None
+
+    email = to_email.lower().strip()
+
+    # ---- Option 1: plus addressing (preferred, realistic) ----
+    # Example: support+ness_bank@company.com
+    if "+" in email:
+        local_part = email.split("@", 1)[0]
+        if "+" in local_part:
+            _, tag = local_part.split("+", 1)
+            tag = tag.strip()
+            if tag:
+                return tag
+
+    # ---- Option 2: keyword hints fallback ----
     for tenant_id, hints in TENANT_EMAIL_HINTS.items():
-        if any(h in t for h in hints):
+        if any(h in email for h in hints):
             return tenant_id
+
     return None
 
+
+# ---------------------------------------------------------------------
+# Handoff summary builders
+# ---------------------------------------------------------------------
 
 def build_vpn_handoff_summary_from_email(req: EmailIngestRequest) -> Dict[str, Any]:
     text = f"{req.subject}\n{req.body}".strip()
@@ -48,7 +79,6 @@ def build_vpn_handoff_summary_from_email(req: EmailIngestRequest) -> Dict[str, A
         "error_code": code_guess,
         "attempt_count": 0,
         "steps_given": [],
-        # extra email context (safe to include; ignored by vpn payload builder except description if you add later)
         "email": {
             "message_id": req.message_id,
             "from": req.from_email,
@@ -58,8 +88,9 @@ def build_vpn_handoff_summary_from_email(req: EmailIngestRequest) -> Dict[str, A
     }
 
 
-def build_generic_handoff_summary_from_email(req: EmailIngestRequest, intent: Intent) -> Dict[str, Any]:
-    # Keep summary stable and vendor-friendly; Jira payload builder will format nicely.
+def build_generic_handoff_summary_from_email(
+    req: EmailIngestRequest, intent: Intent
+) -> Dict[str, Any]:
     return {
         "category": intent,
         "state": "EMAIL_INGEST",
@@ -73,6 +104,10 @@ def build_generic_handoff_summary_from_email(req: EmailIngestRequest, intent: In
     }
 
 
+# ---------------------------------------------------------------------
+# Main processor
+# ---------------------------------------------------------------------
+
 def process_email_to_jira_preview(
     *,
     memory: Any,
@@ -83,14 +118,27 @@ def process_email_to_jira_preview(
     """
     Returns:
       (status, tenant_id, intent, confidence, internal_tags, handoff_summary, jira_payload_preview)
+
     status: processed | pending_tenant
     """
 
-    # ---- Tenant resolution (Header > Body > inferred from to_email) ----
-    candidate_company_id = (x_company_id or req.company_id or infer_tenant_id_from_to_email(req.to_email) or "").strip()
-    tenant, valid = validate_and_get_tenant(candidate_company_id) if candidate_company_id else (None, False)
+    # ---- Tenant resolution ----
+    inferred_tenant = infer_tenant_id_from_to_email(req.to_email)
 
-    # ---- Classify intent (heuristics for now; LLM later) ----
+    candidate_company_id = (
+        x_company_id
+        or req.company_id
+        or inferred_tenant
+        or ""
+    ).strip()
+
+    tenant, valid = (
+        validate_and_get_tenant(candidate_company_id)
+        if candidate_company_id
+        else (None, False)
+    )
+
+    # ---- Intent classification ----
     text = f"{req.subject}\n{req.body}".strip()
     intent, confidence = classify(text, previous_intent=None)
 
@@ -103,18 +151,28 @@ def process_email_to_jira_preview(
     ensure_internal_tags(handoff_summary)
     internal_tags = get_internal_tags(handoff_summary)
 
-    # If tenant missing/invalid -> return pending_tenant (do not build payload)
+    # ---- Missing tenant → pending ----
     if tenant is None:
         logger.info(
             f"email_pending_tenant message_id={req.message_id} "
-            f"candidate_company_id={candidate_company_id or None} valid={valid} intent={intent} conf={confidence:.2f}"
+            f"candidate_company_id={candidate_company_id or None} "
+            f"inferred_from_email={inferred_tenant} "
+            f"intent={intent} conf={confidence:.2f}"
         )
-        return "pending_tenant", None, intent, confidence, internal_tags, handoff_summary, None
+        return (
+            "pending_tenant",
+            None,
+            intent,
+            confidence,
+            internal_tags,
+            handoff_summary,
+            None,
+        )
 
     # ---- Build Jira payload preview ----
     if intent == "VPN_ISSUE":
         jira_payload_preview, labels = build_vpn_payload_preview(
-            session_id=req.message_id,  # use message_id as stable correlation id
+            session_id=req.message_id,
             tenant=tenant,
             handoff_summary=handoff_summary,
         )
@@ -126,7 +184,17 @@ def process_email_to_jira_preview(
         )
 
     logger.info(
-        f"email_processed message_id={req.message_id} tenant_id={tenant.tenant_id} intent={intent} conf={confidence:.2f} labels={labels}"
+        f"email_processed message_id={req.message_id} "
+        f"tenant_id={tenant.tenant_id} "
+        f"intent={intent} conf={confidence:.2f} labels={labels}"
     )
 
-    return "processed", tenant.tenant_id, intent, confidence, internal_tags, handoff_summary, jira_payload_preview
+    return (
+        "processed",
+        tenant.tenant_id,
+        intent,
+        confidence,
+        internal_tags,
+        handoff_summary,
+        jira_payload_preview,
+    )
