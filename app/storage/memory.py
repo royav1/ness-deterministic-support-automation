@@ -11,9 +11,10 @@ class MemoryStore:
     """
     In-memory session store with TTL.
 
+    Sessions (chat):
     - session_id -> list of (role, message)
     - session_id -> last detected intent (context)
-    - session_id -> vpn context (Part 2)
+    - session_id -> vpn context
     - session_id -> company_id (tenant)
     - session_id -> pending_handoff_summary (dict)  # used when tenant is missing at escalation time
     - session_id -> last_seen timestamp (for expiration)
@@ -21,9 +22,14 @@ class MemoryStore:
     Email ingestion (Mode A):
     - message_id -> processed marker (idempotency / dedupe)
     - message_id -> receipt (stored response payload for deterministic duplicate responses)
+
+    Email ingestion (Mode B):
+    - message_id -> pending payload (stored when tenant is missing / pending_tenant)
+      so it can later be resolved via /email/resolve.
     """
 
     def __init__(self, ttl_seconds: int = 30 * 60) -> None:
+        # Chat session state
         self._sessions: Dict[str, List[Tuple[str, str]]] = {}
         self._last_intent: Dict[str, Intent] = {}
         self._vpn_context: Dict[str, VpnContext] = {}
@@ -39,10 +45,27 @@ class MemoryStore:
         # message_id -> {"ts": float, "receipt": dict}
         self._email_receipts: Dict[str, Dict[str, Any]] = {}
 
+        # Email pending payloads (Mode B)
+        # message_id -> {"ts": float, "payload": dict}
+        self._pending_emails: Dict[str, Dict[str, Any]] = {}
+
         self._ttl_seconds = ttl_seconds
 
+    # ---------- Internal helpers ----------
+
+    def _now(self) -> float:
+        return time.time()
+
+    def _norm_message_id(self, message_id: Optional[str]) -> str:
+        return (message_id or "").strip()
+
+    def _touch(self, session_id: str) -> None:
+        self._last_seen[session_id] = self._now()
+
+    # ---------- TTL cleanup ----------
+
     def cleanup_expired(self) -> int:
-        now = time.time()
+        now = self._now()
         expired_ids: List[str] = []
 
         for sid, last_seen in list(self._last_seen.items()):
@@ -68,10 +91,15 @@ class MemoryStore:
             if isinstance(ts, (int, float)) and (now - float(ts) > self._ttl_seconds):
                 self._email_receipts.pop(mid, None)
 
+        # Cleanup pending emails on the same TTL window
+        for mid, obj in list(self._pending_emails.items()):
+            ts = obj.get("ts")
+            if isinstance(ts, (int, float)) and (now - float(ts) > self._ttl_seconds):
+                self._pending_emails.pop(mid, None)
+
         return len(expired_ids)
 
-    def _touch(self, session_id: str) -> None:
-        self._last_seen[session_id] = time.time()
+    # ---------- Chat sessions ----------
 
     def get_or_create_session(self, session_id: str | None) -> tuple[str, bool]:
         self.cleanup_expired()
@@ -113,7 +141,7 @@ class MemoryStore:
         self._last_intent[session_id] = intent
         self._touch(session_id)
 
-    # ===== Company / tenant =====
+    # ----- Company / tenant -----
 
     def get_company_id(self, session_id: str) -> Optional[str]:
         self.cleanup_expired()
@@ -126,7 +154,7 @@ class MemoryStore:
         self._company_id[session_id] = company_id
         self._touch(session_id)
 
-    # ===== Pending handoff (tenant missing at escalation time) =====
+    # ----- Pending handoff (chat escalation missing tenant) -----
 
     def get_pending_handoff_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
         self.cleanup_expired()
@@ -145,7 +173,7 @@ class MemoryStore:
         if session_id in self._sessions:
             self._touch(session_id)
 
-    # ===== VPN context (Part 2) =====
+    # ----- VPN context -----
 
     def get_vpn_context(self, session_id: str) -> VpnContext:
         self.cleanup_expired()
@@ -164,21 +192,21 @@ class MemoryStore:
         if session_id in self._sessions:
             self._touch(session_id)
 
-    # ===== Email idempotency + receipts (Mode A / Option B) =====
+    # ---------- Email idempotency + receipts (Mode A / Option B) ----------
 
     def is_email_processed(self, message_id: str) -> bool:
         self.cleanup_expired()
-        mid = (message_id or "").strip()
+        mid = self._norm_message_id(message_id)
         if not mid:
             return False
         return mid in self._processed_emails
 
     def mark_email_processed(self, message_id: str) -> None:
         self.cleanup_expired()
-        mid = (message_id or "").strip()
+        mid = self._norm_message_id(message_id)
         if not mid:
             return
-        self._processed_emails[mid] = time.time()
+        self._processed_emails[mid] = self._now()
 
     def get_email_receipt(self, message_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -186,7 +214,7 @@ class MemoryStore:
         Used to return deterministic information on duplicates.
         """
         self.cleanup_expired()
-        mid = (message_id or "").strip()
+        mid = self._norm_message_id(message_id)
         if not mid:
             return None
         obj = self._email_receipts.get(mid)
@@ -200,12 +228,63 @@ class MemoryStore:
         Store receipt dict (response payload) for a processed email message_id.
         """
         self.cleanup_expired()
-        mid = (message_id or "").strip()
+        mid = self._norm_message_id(message_id)
         if not mid:
             return
         if not isinstance(receipt, dict):
             return
-        self._email_receipts[mid] = {"ts": time.time(), "receipt": receipt}
+        self._email_receipts[mid] = {"ts": self._now(), "receipt": receipt}
+
+    # ---------- Email pending storage (Mode B) ----------
+
+    def get_pending_email(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return stored pending email payload for message_id, if exists.
+        Payload is meant to be used by /email/resolve.
+        """
+        self.cleanup_expired()
+        mid = self._norm_message_id(message_id)
+        if not mid:
+            return None
+
+        obj = self._pending_emails.get(mid)
+        if not isinstance(obj, dict):
+            return None
+        payload = obj.get("payload")
+        return payload if isinstance(payload, dict) else None
+
+    def set_pending_email(self, message_id: str, payload: Dict[str, Any]) -> None:
+        """
+        Store pending email payload when tenant is missing (pending_tenant).
+        """
+        self.cleanup_expired()
+        mid = self._norm_message_id(message_id)
+        if not mid:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._pending_emails[mid] = {"ts": self._now(), "payload": payload}
+
+    def clear_pending_email(self, message_id: str) -> None:
+        """
+        Remove pending email payload after successful resolve or manual cleanup.
+        """
+        self.cleanup_expired()
+        mid = self._norm_message_id(message_id)
+        if not mid:
+            return
+        self._pending_emails.pop(mid, None)
+
+    def list_pending_emails(self) -> List[str]:
+        """
+        Mode B helper:
+        Return a stable list of all message_ids currently stored as pending.
+        """
+        self.cleanup_expired()
+        # Sorted for stable output (nice for UI/debugging)
+        return sorted(self._pending_emails.keys())
+
+    # ---------- Deletion ----------
 
     def delete_session(self, session_id: str) -> bool:
         self.cleanup_expired()

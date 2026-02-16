@@ -28,6 +28,24 @@ class EmailIngestRequest(BaseModel):
     )
 
 
+class EmailResolveRequest(BaseModel):
+    """
+    Used by POST /email/resolve to resolve a previously pending email
+    when tenant/company_id was missing at ingest time.
+    """
+    message_id: str = Field(
+        min_length=3,
+        max_length=512,
+        description="Email Message-ID that was previously pending",
+    )
+
+    company_id: str = Field(
+        min_length=3,
+        max_length=128,
+        description="Tenant/company identifier to resolve against (e.g. ness_bank)",
+    )
+
+
 class EmailIngestResponse(BaseModel):
     status: EmailIngestStatus = Field(description="processed | duplicate_skipped | pending_tenant")
 

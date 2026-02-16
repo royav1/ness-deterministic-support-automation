@@ -12,21 +12,31 @@ class RedisMemoryStore:
     """
     Redis-backed session store with TTL via Redis key expiration.
 
-    Keys:
-      - session:{id}:messages            (Redis LIST)   each item is JSON: {"role": "...", "message": "..."}
-      - session:{id}:last_intent         (Redis STRING)
-      - session:{id}:vpn_context         (Redis STRING) JSON dump of VpnContext
-      - session:{id}:company_id          (Redis STRING)
-      - session:{id}:pending_handoff     (Redis STRING) JSON dump of handoff_summary
+    Session keys:
+      - session:{id}:messages
+      - session:{id}:last_intent
+      - session:{id}:vpn_context
+      - session:{id}:company_id
+      - session:{id}:pending_handoff
 
     Email ingestion (Mode A):
-      - email:{message_id}:processed     (Redis STRING) value="1" with TTL
-      - email:{message_id}:receipt       (Redis STRING) JSON receipt with TTL
+      - email:{message_id}:processed
+      - email:{message_id}:receipt
+
+    Email ingestion (Mode B):
+      - email:{message_id}:pending
     """
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0", ttl_seconds: int = 30 * 60) -> None:
         self.redis = Redis.from_url(redis_url, decode_responses=True)
         self.ttl_seconds = ttl_seconds
+
+    # ---------- Internal helpers ----------
+
+    def _norm_mid(self, message_id: Optional[str]) -> str:
+        return (message_id or "").strip()
+
+    # ---------- Key helpers ----------
 
     def _messages_key(self, session_id: str) -> str:
         return f"session:{session_id}:messages"
@@ -43,7 +53,7 @@ class RedisMemoryStore:
     def _pending_handoff_key(self, session_id: str) -> str:
         return f"session:{session_id}:pending_handoff"
 
-    # ===== Email idempotency / receipts (Mode A - Option B) =====
+    # ----- Email keys -----
 
     def _email_processed_key(self, message_id: str) -> str:
         return f"email:{message_id}:processed"
@@ -51,34 +61,39 @@ class RedisMemoryStore:
     def _email_receipt_key(self, message_id: str) -> str:
         return f"email:{message_id}:receipt"
 
-    def _touch(self, session_id: str) -> None:
-        mk = self._messages_key(session_id)
-        ik = self._intent_key(session_id)
-        vk = self._vpn_key(session_id)
-        ck = self._company_key(session_id)
-        pk = self._pending_handoff_key(session_id)
+    def _email_pending_key(self, message_id: str) -> str:
+        return f"email:{message_id}:pending"
 
-        self.redis.expire(mk, self.ttl_seconds)
-        self.redis.expire(ik, self.ttl_seconds)
-        self.redis.expire(vk, self.ttl_seconds)
-        self.redis.expire(ck, self.ttl_seconds)
-        self.redis.expire(pk, self.ttl_seconds)
+    # ---------- Session TTL touch ----------
+
+    def _touch(self, session_id: str) -> None:
+        keys = [
+            self._messages_key(session_id),
+            self._intent_key(session_id),
+            self._vpn_key(session_id),
+            self._company_key(session_id),
+            self._pending_handoff_key(session_id),
+        ]
+        for k in keys:
+            self.redis.expire(k, self.ttl_seconds)
+
+    # ---------- Sessions ----------
 
     def get_or_create_session(self, session_id: str | None) -> tuple[str, bool]:
         new_session_id = session_id or str(uuid.uuid4())
         mk = self._messages_key(new_session_id)
-
         existed = self.redis.exists(mk) == 1
-        return new_session_id, (not existed)
+        return new_session_id, not existed
 
     def session_exists(self, session_id: str) -> bool:
-        mk = self._messages_key(session_id)
-        return self.redis.exists(mk) == 1
+        return self.redis.exists(self._messages_key(session_id)) == 1
 
     def add_message(self, session_id: str, role: str, message: str) -> None:
         mk = self._messages_key(session_id)
-        item = json.dumps({"role": role, "message": message}, ensure_ascii=False)
-        self.redis.rpush(mk, item)
+        self.redis.rpush(
+            mk,
+            json.dumps({"role": role, "message": message}, ensure_ascii=False),
+        )
         self._touch(session_id)
 
     def get_history(self, session_id: str) -> List[Tuple[str, str]]:
@@ -90,46 +105,39 @@ class RedisMemoryStore:
             try:
                 obj = json.loads(raw)
                 history.append((obj.get("role", ""), obj.get("message", "")))
-            except json.JSONDecodeError:
+            except Exception:
                 continue
 
         self._touch(session_id)
         return history
 
     def get_last_intent(self, session_id: str) -> Optional[Intent]:
-        ik = self._intent_key(session_id)
-        val = self.redis.get(ik)
+        val = self.redis.get(self._intent_key(session_id))
         self._touch(session_id)
         return val  # type: ignore[return-value]
 
     def set_last_intent(self, session_id: str, intent: Intent) -> None:
-        ik = self._intent_key(session_id)
-        self.redis.set(ik, intent)
+        self.redis.set(self._intent_key(session_id), intent)
         self._touch(session_id)
 
-    # ===== Company / tenant =====
+    # ---------- Tenant ----------
 
     def get_company_id(self, session_id: str) -> Optional[str]:
-        ck = self._company_key(session_id)
-        val = self.redis.get(ck)
+        val = self.redis.get(self._company_key(session_id))
         self._touch(session_id)
         return val
 
     def set_company_id(self, session_id: str, company_id: str) -> None:
-        ck = self._company_key(session_id)
-        self.redis.set(ck, company_id)
+        self.redis.set(self._company_key(session_id), company_id)
         self._touch(session_id)
 
-    # ===== Pending handoff (tenant missing at escalation time) =====
+    # ---------- Pending handoff (chat) ----------
 
     def get_pending_handoff_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
-        pk = self._pending_handoff_key(session_id)
-        raw = self.redis.get(pk)
+        raw = self.redis.get(self._pending_handoff_key(session_id))
         self._touch(session_id)
-
         if not raw:
             return None
-
         try:
             obj = json.loads(raw)
             return obj if isinstance(obj, dict) else None
@@ -137,68 +145,56 @@ class RedisMemoryStore:
             return None
 
     def set_pending_handoff_summary(self, session_id: str, summary: Dict[str, Any]) -> None:
-        pk = self._pending_handoff_key(session_id)
-        self.redis.set(pk, json.dumps(summary, ensure_ascii=False))
+        self.redis.set(
+            self._pending_handoff_key(session_id),
+            json.dumps(summary, ensure_ascii=False),
+        )
         self._touch(session_id)
 
     def clear_pending_handoff(self, session_id: str) -> None:
-        pk = self._pending_handoff_key(session_id)
-        self.redis.delete(pk)
+        self.redis.delete(self._pending_handoff_key(session_id))
         self._touch(session_id)
 
-    # ===== VPN context storage (Part 2) =====
+    # ---------- VPN context ----------
 
     def get_vpn_context(self, session_id: str) -> VpnContext:
-        vk = self._vpn_key(session_id)
-        raw = self.redis.get(vk)
-
+        raw = self.redis.get(self._vpn_key(session_id))
         self._touch(session_id)
-
         if not raw:
             return VpnContext()
-
         try:
             return VpnContext.model_validate_json(raw)
         except Exception:
             return VpnContext()
 
     def set_vpn_context(self, session_id: str, ctx: VpnContext) -> None:
-        vk = self._vpn_key(session_id)
-        self.redis.set(vk, ctx.model_dump_json())
+        self.redis.set(self._vpn_key(session_id), ctx.model_dump_json())
         self._touch(session_id)
 
     def clear_vpn_context(self, session_id: str) -> None:
-        vk = self._vpn_key(session_id)
-        self.redis.delete(vk)
+        self.redis.delete(self._vpn_key(session_id))
         self._touch(session_id)
 
-    # ===== Email idempotency + receipts (Mode A) =====
+    # ---------- Email idempotency + receipts (Mode A) ----------
 
     def is_email_processed(self, message_id: str) -> bool:
-        mid = (message_id or "").strip()
+        mid = self._norm_mid(message_id)
         if not mid:
             return False
-        k = self._email_processed_key(mid)
-        return self.redis.exists(k) == 1
+        return self.redis.exists(self._email_processed_key(mid)) == 1
 
     def mark_email_processed(self, message_id: str) -> None:
-        mid = (message_id or "").strip()
+        mid = self._norm_mid(message_id)
         if not mid:
             return
-        k = self._email_processed_key(mid)
-        # store marker with TTL (idempotency window)
-        self.redis.setex(k, self.ttl_seconds, "1")
+        self.redis.setex(self._email_processed_key(mid), self.ttl_seconds, "1")
 
     def get_email_receipt(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Return stored receipt dict (response payload) for a processed email message_id.
-        """
-        mid = (message_id or "").strip()
+        mid = self._norm_mid(message_id)
         if not mid:
             return None
 
-        rk = self._email_receipt_key(mid)
-        raw = self.redis.get(rk)
+        raw = self.redis.get(self._email_receipt_key(mid))
         if not raw:
             return None
 
@@ -209,23 +205,88 @@ class RedisMemoryStore:
             return None
 
     def set_email_receipt(self, message_id: str, receipt: Dict[str, Any]) -> None:
-        """
-        Store receipt dict (response payload) for a processed email message_id, with TTL.
-        """
-        mid = (message_id or "").strip()
+        mid = self._norm_mid(message_id)
+        if not mid or not isinstance(receipt, dict):
+            return
+
+        self.redis.setex(
+            self._email_receipt_key(mid),
+            self.ttl_seconds,
+            json.dumps(receipt, ensure_ascii=False),
+        )
+
+    # ---------- Email pending storage (Mode B) ----------
+
+    def get_pending_email(self, message_id: str) -> Optional[Dict[str, Any]]:
+        mid = self._norm_mid(message_id)
+        if not mid:
+            return None
+
+        raw = self.redis.get(self._email_pending_key(mid))
+        if not raw:
+            return None
+
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def set_pending_email(self, message_id: str, payload: Dict[str, Any]) -> None:
+        mid = self._norm_mid(message_id)
+        if not mid or not isinstance(payload, dict):
+            return
+
+        self.redis.setex(
+            self._email_pending_key(mid),
+            self.ttl_seconds,
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+    def clear_pending_email(self, message_id: str) -> None:
+        mid = self._norm_mid(message_id)
         if not mid:
             return
-        if not isinstance(receipt, dict):
-            return
+        self.redis.delete(self._email_pending_key(mid))
 
-        rk = self._email_receipt_key(mid)
-        self.redis.setex(rk, self.ttl_seconds, json.dumps(receipt, ensure_ascii=False))
+    def list_pending_emails(self, limit: int = 200) -> List[str]:
+        """
+        Mode B helper:
+        Return a stable list of message_ids currently stored as pending.
+
+        Uses SCAN to avoid blocking Redis. `limit` caps how many IDs we return.
+        """
+        pattern = "email:*:pending"
+        cursor = 0
+        out: List[str] = []
+
+        while True:
+            cursor, keys = self.redis.scan(cursor=cursor, match=pattern, count=200)
+
+            for k in keys:
+                # key format: email:{message_id}:pending
+                # split only the outer parts so message_id can safely contain ':'
+                if not k.startswith("email:") or not k.endswith(":pending"):
+                    continue
+                mid = k[len("email:") : -len(":pending")]
+                if mid:
+                    out.append(mid)
+                    if len(out) >= limit:
+                        return sorted(set(out))
+
+            if cursor == 0:
+                break
+
+        return sorted(set(out))
+
+    # ---------- Cleanup ----------
 
     def delete_session(self, session_id: str) -> bool:
-        mk = self._messages_key(session_id)
-        ik = self._intent_key(session_id)
-        vk = self._vpn_key(session_id)
-        ck = self._company_key(session_id)
-        pk = self._pending_handoff_key(session_id)
-        deleted = self.redis.delete(mk, ik, vk, ck, pk)
+        deleted = self.redis.delete(
+            self._messages_key(session_id),
+            self._intent_key(session_id),
+            self._vpn_key(session_id),
+            self._company_key(session_id),
+            self._pending_handoff_key(session_id),
+        )
         return deleted > 0

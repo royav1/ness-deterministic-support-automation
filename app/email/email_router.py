@@ -105,7 +105,57 @@ def build_generic_handoff_summary_from_email(
 
 
 # ---------------------------------------------------------------------
-# Main processor
+# Pending storage helpers (Mode B)
+# ---------------------------------------------------------------------
+
+def _store_pending_email_if_supported(
+    *,
+    memory: Any,
+    message_id: str,
+    pending_payload: Dict[str, Any],
+) -> None:
+    """
+    Store pending email payload when tenant is missing, if the store supports it.
+    Works for both MemoryStore + RedisMemoryStore (they both have set_pending_email).
+    """
+    setter = getattr(memory, "set_pending_email", None)
+    if callable(setter):
+        try:
+            setter(message_id, pending_payload)
+        except Exception:
+            pass
+
+
+def _get_pending_email_if_supported(
+    *,
+    memory: Any,
+    message_id: str,
+) -> Optional[Dict[str, Any]]:
+    getter = getattr(memory, "get_pending_email", None)
+    if callable(getter):
+        try:
+            payload = getter(message_id)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _clear_pending_email_if_supported(
+    *,
+    memory: Any,
+    message_id: str,
+) -> None:
+    clearer = getattr(memory, "clear_pending_email", None)
+    if callable(clearer):
+        try:
+            clearer(message_id)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------
+# Main processor (ingest)
 # ---------------------------------------------------------------------
 
 def process_email_to_jira_preview(
@@ -153,6 +203,19 @@ def process_email_to_jira_preview(
 
     # ---- Missing tenant → pending ----
     if tenant is None:
+        # Mode B: persist a pending payload so /email/resolve can complete it later
+        pending_payload: Dict[str, Any] = {
+            "message_id": req.message_id,
+            "intent": intent,
+            "confidence": float(confidence),
+            "internal_tags": internal_tags,
+            "handoff_summary": handoff_summary,
+            # keep a tiny bit of debug context (optional but useful)
+            "candidate_company_id": candidate_company_id or None,
+            "inferred_from_email": inferred_tenant,
+        }
+        _store_pending_email_if_supported(memory=memory, message_id=req.message_id, pending_payload=pending_payload)
+
         logger.info(
             f"email_pending_tenant message_id={req.message_id} "
             f"candidate_company_id={candidate_company_id or None} "
@@ -198,3 +261,83 @@ def process_email_to_jira_preview(
         handoff_summary,
         jira_payload_preview,
     )
+
+
+# ---------------------------------------------------------------------
+# Mode B: resolve pending email later (/email/resolve)
+# ---------------------------------------------------------------------
+
+def process_email_resolution_to_jira_preview(
+    *,
+    memory: Any,
+    message_id: str,
+    company_id: str,
+    logger: Any,
+) -> Tuple[str, Optional[str], Intent, float, List[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    Resolve a previously pending email by providing company_id.
+
+    Returns the same tuple structure as process_email_to_jira_preview:
+      (status, tenant_id, intent, confidence, internal_tags, handoff_summary, jira_payload_preview)
+
+    status:
+      - processed          -> resolved and payload created
+      - pending_tenant     -> still not resolvable (bad company_id or missing pending record)
+    """
+    mid = (message_id or "").strip()
+    cid = (company_id or "").strip()
+
+    if not mid or not cid:
+        # Treat as still pending / not resolvable
+        logger.info(f"email_resolve_invalid_input message_id={mid or None} company_id={cid or None}")
+        return ("pending_tenant", None, "UNKNOWN", 0.0, [], {"category": "UNKNOWN", "state": "EMAIL_RESOLVE"}, None)
+
+    pending = _get_pending_email_if_supported(memory=memory, message_id=mid)
+    if not pending:
+        logger.info(f"email_resolve_missing_pending message_id={mid}")
+        return ("pending_tenant", None, "UNKNOWN", 0.0, [], {"category": "UNKNOWN", "state": "EMAIL_RESOLVE"}, None)
+
+    tenant, valid = validate_and_get_tenant(cid)
+    if tenant is None:
+        logger.info(f"email_resolve_invalid_tenant message_id={mid} company_id={cid} valid={valid}")
+        # Keep the original pending details if we have them
+        intent = pending.get("intent", "UNKNOWN")
+        confidence = float(pending.get("confidence", 0.0) or 0.0)
+        handoff_summary = pending.get("handoff_summary") if isinstance(pending.get("handoff_summary"), dict) else {"category": intent, "state": "EMAIL_INGEST"}
+        internal_tags = pending.get("internal_tags") if isinstance(pending.get("internal_tags"), list) else []
+        return ("pending_tenant", None, intent, confidence, internal_tags, handoff_summary, None)
+
+    # Pull original derived info
+    intent = pending.get("intent", "UNKNOWN")
+    confidence = float(pending.get("confidence", 0.0) or 0.0)
+
+    handoff_summary = pending.get("handoff_summary")
+    if not isinstance(handoff_summary, dict):
+        handoff_summary = {"category": intent, "state": "EMAIL_INGEST"}
+
+    # Ensure tags exist (idempotent)
+    ensure_internal_tags(handoff_summary)
+    internal_tags = get_internal_tags(handoff_summary)
+
+    # Build Jira payload preview (now that tenant is known)
+    if intent == "VPN_ISSUE":
+        jira_payload_preview, labels = build_vpn_payload_preview(
+            session_id=mid,
+            tenant=tenant,
+            handoff_summary=handoff_summary,
+        )
+    else:
+        jira_payload_preview, labels = build_generic_payload_preview(
+            correlation_id=mid,
+            tenant=tenant,
+            handoff_summary=handoff_summary,
+        )
+
+    # Pending resolved successfully -> clear pending record
+    _clear_pending_email_if_supported(memory=memory, message_id=mid)
+
+    logger.info(
+        f"email_resolved message_id={mid} tenant_id={tenant.tenant_id} intent={intent} conf={confidence:.2f} labels={labels}"
+    )
+
+    return ("processed", tenant.tenant_id, intent, confidence, internal_tags, handoff_summary, jira_payload_preview)
